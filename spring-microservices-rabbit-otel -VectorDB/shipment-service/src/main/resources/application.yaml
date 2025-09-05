@@ -1,0 +1,51 @@
+spring:
+  application:
+    name: shipment-service
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    cache:
+      channel:
+        size: ${RABBITMQ_CACHE_CHANNEL_SIZE:500} # default 500
+      connection:
+        mode: channel
+  jpa:
+    hibernate:
+      ddl-auto: update
+  datasource:
+    url: jdbc:h2:file:./data/shipment.db
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  h2:
+    console:
+      enabled: true
+  otel:
+    exporter:
+      otlp:
+#        endpoint: http://otel-collector:4318/v1/traces
+        endpoint: http://otel-collector:4317
+#      otlpMetrics :
+#        endpoint: http://otel-collector:4318/v1/metrics
+    traces:
+      exporter: otlp
+    metrics:
+      exporter : otlp
+    logs:
+      exporter: otlp
+    service:
+      name: shipment-service
+management:
+  tracing:
+    enabled: true
+    sampling:
+      probability: 1.0 # Always sample during dev
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+server:
+  port: 8105

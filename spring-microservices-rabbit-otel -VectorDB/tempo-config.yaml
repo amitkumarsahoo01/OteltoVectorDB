@@ -1,0 +1,30 @@
+server:
+  http_listen_port: 3200
+  log_level: info
+storage:
+  trace:
+    backend: local # backend configuration to use
+    wal:
+      path: /var/tempo/wal # where to store the wal locally
+    local:
+      path: /var/tempo/blocks
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+overrides:
+  metrics_generator_processors: [service-graphs, span-metrics] # enables metrics generator
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: docker-compose
+  storage:
+    path: /tmp/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
