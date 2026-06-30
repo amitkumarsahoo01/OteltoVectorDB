@@ -1,0 +1,330 @@
+################################################################################
+# OteltoVectorDB — Local POC (Docker Desktop)
+#
+# Architecture:
+#   ┌─ App cluster ──────────────────────────────────────────────────────────┐
+#   │  catalog · order · inventory · payment · shipment  (Spring Boot/OTel)  │
+#   │  postgres (pgvector)  ·  rabbitmq                                      │
+#   └────────────────────────────────────────────────────────────────────────┘
+#   ┌─ Observability cluster (simulated separate) ───────────────────────────┐
+#   │  otel-collector · jaeger · tempo · prometheus · loki · grafana         │
+#   └────────────────────────────────────────────────────────────────────────┘
+#   ┌─ AI pipeline ──────────────────────────────────────────────────────────┐
+#   │  telemetry-pipeline (OTel→pgvector)  ·  rag-service (Claude RAG)      │
+#   └────────────────────────────────────────────────────────────────────────┘
+#
+# Usage:
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   docker compose up --build
+#
+# Key URLs:
+#   RAG Demo UI   → http://localhost:8200
+#   Jaeger        → http://localhost:16686
+#   Grafana       → http://localhost:3000  (admin / verysecret)
+#   RabbitMQ UI   → http://localhost:15672 (guest / guest)
+#   Swagger UI    → http://localhost:8100/swagger-ui.html (catalog-service)
+################################################################################
+
+x-db-env: &db-env
+  DB_URL: jdbc:postgresql://postgres:5432/
+  DB_USERNAME: postgres
+  DB_PASSWORD: postgres
+  DB_DRIVER: org.postgresql.Driver
+  DB_DIALECT: org.hibernate.dialect.PostgreSQLDialect
+  H2_CONSOLE: "false"
+
+x-rabbit-env: &rabbit-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: guest
+  RABBITMQ_PASS: guest
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_METRICS_EXPORTER: otlp
+  OTEL_LOGS_EXPORTER: otlp
+  OTEL_TRACES_EXPORTER: otlp
+
+x-svc-healthcheck: &svc-hc
+  test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+  interval: 20s
+  timeout: 5s
+  retries: 5
+  start_period: 60s
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [app, ai]
+
+  rabbitmq:
+    image: rabbitmq:4.0.2-management
+    container_name: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [app]
+
+  # ── Observability stack (simulates separate OTel cluster) ───────────────────
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape
+    depends_on:
+      jaeger:
+        condition: service_started
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks: [app, observability, ai]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14317:4317"   # OTLP gRPC (host-side remapped to avoid collision)
+    networks: [observability, ai]
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo-config.yaml"]
+    volumes:
+      - ./tempo-config.yaml:/etc/tempo-config.yaml
+      - tempo_data:/tmp/tempo
+    ports:
+      - "3200:3200"
+    networks: [observability]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --enable-feature=exemplar-storage
+      - --web.enable-remote-write-receiver
+    ports:
+      - "9090:9090"
+    networks: [observability]
+
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    networks: [observability]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: verysecret
+      GF_SERVER_HTTP_PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus, tempo, loki]
+    networks: [observability]
+
+  # ── Spring Boot microservices ───────────────────────────────────────────────
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: catalog-service
+    container_name: catalog-service
+    environment:
+      <<: [*db-env, *rabbit-env, *otel-env]
+      DB_URL: jdbc:postgresql://postgres:5432/catalogdb
+      OTEL_SERVICE_NAME: catalog-service
+    ports:
+      - "8100:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [app, observability]
+
+  order-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: order-service
+    container_name: order-service
+    environment:
+      <<: [*db-env, *rabbit-env, *otel-env]
+      DB_URL: jdbc:postgresql://postgres:5432/orderdb
+      OTEL_SERVICE_NAME: order-service
+    ports:
+      - "8102:8102"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [app, observability]
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: inventory-service
+    container_name: inventory-service
+    environment:
+      <<: [*db-env, *rabbit-env, *otel-env]
+      DB_URL: jdbc:postgresql://postgres:5432/inventorydb
+      OTEL_SERVICE_NAME: inventory-service
+    ports:
+      - "8101:8101"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [app, observability]
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: payment-service
+    container_name: payment-service
+    environment:
+      <<: [*db-env, *rabbit-env, *otel-env]
+      DB_URL: jdbc:postgresql://postgres:5432/paymentdb
+      OTEL_SERVICE_NAME: payment-service
+    ports:
+      - "8103:8103"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [app, observability]
+
+  shipment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_NAME: shipment-service
+    container_name: shipment-service
+    environment:
+      <<: [*db-env, *rabbit-env, *otel-env]
+      DB_URL: jdbc:postgresql://postgres:5432/shipmentdb
+      OTEL_SERVICE_NAME: shipment-service
+    ports:
+      - "8104:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks: [app, observability]
+
+  # ── AI pipeline ─────────────────────────────────────────────────────────────
+
+  telemetry-pipeline:
+    build:
+      context: ./telemetry-pipeline
+      dockerfile: Dockerfile
+    container_name: telemetry-pipeline
+    environment:
+      DB_URL: postgresql://postgres:postgres@postgres:5432/telemetrydb
+      JAEGER_URL: http://jaeger:16686
+      POLL_INTERVAL: "30"
+      STARTUP_DELAY: "20"
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    networks: [observability, ai]
+
+  rag-service:
+    build:
+      context: ./rag-service
+      dockerfile: Dockerfile
+    container_name: rag-service
+    environment:
+      DB_URL: postgresql://postgres:postgres@postgres:5432/telemetrydb
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      CLAUDE_MODEL: claude-haiku-4-5-20251001
+      TOP_K: "12"
+    ports:
+      - "8200:8200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telemetry-pipeline:
+        condition: service_started
+    networks: [ai]
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  app:           {}   # microservices + rabbitmq + postgres
+  observability: {}   # otel-collector + jaeger + tempo + prometheus + loki + grafana
+  ai:            {}   # postgres + telemetry-pipeline + rag-service
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data: {}
+  tempo_data:    {}
