@@ -1,57 +1,42 @@
 spring:
   application:
     name: catalog-service
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USER:guest}
+    password: ${RABBITMQ_PASS:guest}
+    virtual-host: /
+    cache:
+      channel:
+        size: ${RABBITMQ_CACHE_CHANNEL_SIZE:500}
+      connection:
+        mode: channel
+  datasource:
+    url: ${DB_URL:jdbc:h2:file:./data/catalog.db}
+    username: ${DB_USERNAME:sa}
+    password: ${DB_PASSWORD:}
+    driver-class-name: ${DB_DRIVER:org.h2.Driver}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    database-platform: ${DB_DIALECT:org.hibernate.dialect.H2Dialect}
+    properties:
+      hibernate:
+        format_sql: false
+  h2:
+    console:
+      enabled: ${H2_CONSOLE:true}
 
 management:
   tracing:
     enabled: true
     sampling:
-      probability: 1.0 # Always sample during dev
-  metrics:
-    export:
-      otlp:
-        enabled: true
+      probability: 1.0
   endpoints:
     web:
       exposure:
-        include: health,info,prometheus
-  rabbitmq:
-    host: localhost
-    port: 5672
-    username: guest
-    password: guest
-    virtual-host: /
-    cache:
-      channel:
-        size: ${RABBITMQ_CACHE_CHANNEL_SIZE:500} # default 500
-      connection:
-        mode: channel
-  datasource:
-    url: jdbc:h2:file:./data/catalog.db
-    username: sa
-    password:
-    driver-class-name: org.h2.Driver
-  jpa:
-    hibernate:
-      ddl-auto: update
-    properties:
-      hibernate.dialect: org.hibernate.dialect.H2Dialect
-  h2:
-    console:
-      enabled: true
-  otel:
-    exporter:
-      otlp:
-        endpoint: http://otel-collector:4317
-#      otlpMetrics :
-#        endpoint : http://otel-collector:4318/v1/metrics
-    traces:
-      exporter: otlp
-    metrics:
-      exporter : otlp
-    logs:
-      exporter: otlp
-    service:
-      name: catalog-service
+        include: health,info,prometheus,metrics
+
 server:
   port: 8100
