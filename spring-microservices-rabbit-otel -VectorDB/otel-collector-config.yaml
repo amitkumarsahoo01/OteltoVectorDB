@@ -57,10 +57,10 @@ service:
 
     metrics:
       receivers:  [otlp]
-      processors: [batch]
-      exporters:  [prometheus]
+      processors: [memory_limiter, batch]
+      exporters:  [prometheus, otlphttp/pipeline]
 
     logs:
       receivers:  [otlp]
       processors: [memory_limiter, batch]
-      exporters:  [otlphttp/loki]
+      exporters:  [otlphttp/loki, otlphttp/pipeline]

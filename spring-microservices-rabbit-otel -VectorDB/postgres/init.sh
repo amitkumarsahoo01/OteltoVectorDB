@@ -17,7 +17,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "telemetrydb" <<-EO
 
     CREATE TABLE IF NOT EXISTS telemetry_embeddings (
         id          SERIAL PRIMARY KEY,
-        source_type VARCHAR(20)  NOT NULL,           -- 'trace' or 'log'
+        source_type VARCHAR(20)  NOT NULL,           -- 'trace', 'log', or 'metric'
         source_id   VARCHAR(512) NOT NULL UNIQUE,    -- trace_id+span_id or log hash
         service_name    VARCHAR(255),
         operation_name  VARCHAR(512),
@@ -30,9 +30,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "telemetrydb" <<-EO
         telemetry_timestamp TIMESTAMPTZ
     );
 
+    -- HNSW, not IVFFlat: IVFFlat computes its cluster centroids at index-build
+    -- time, so building it here (on an empty table) yields garbage centroids and
+    -- similarity queries miss rows. HNSW has no such training step and works
+    -- correctly regardless of table size.
     CREATE INDEX IF NOT EXISTS idx_telemetry_embedding
-        ON telemetry_embeddings USING ivfflat (embedding vector_cosine_ops)
-        WITH (lists = 100);
+        ON telemetry_embeddings USING hnsw (embedding vector_cosine_ops);
 
     CREATE INDEX IF NOT EXISTS idx_telemetry_source_id  ON telemetry_embeddings (source_id);
     CREATE INDEX IF NOT EXISTS idx_telemetry_service    ON telemetry_embeddings (service_name);

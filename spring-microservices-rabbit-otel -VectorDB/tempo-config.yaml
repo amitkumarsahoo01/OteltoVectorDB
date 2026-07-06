@@ -17,14 +17,16 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 overrides:
-  metrics_generator_processors: [service-graphs, span-metrics] # enables metrics generator
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics] # enables metrics generator
 metrics_generator:
   registry:
     external_labels:
       source: tempo
       cluster: docker-compose
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/tempo/generator/wal
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true

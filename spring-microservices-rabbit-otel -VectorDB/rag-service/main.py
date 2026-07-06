@@ -42,6 +42,7 @@ class QueryRequest(BaseModel):
     top_k: Optional[int] = None
 
 class SourceItem(BaseModel):
+    source_type: Optional[str]
     service: Optional[str]
     operation: Optional[str]
     status: Optional[str]
@@ -74,11 +75,18 @@ def stats():
             cur.execute("SELECT COUNT(*) FROM telemetry_embeddings")
             total = cur.fetchone()[0]
             cur.execute("""
-                SELECT service_name, status, COUNT(*) AS cnt,
+                SELECT source_type, COUNT(*) AS cnt
+                FROM telemetry_embeddings
+                GROUP BY source_type
+                ORDER BY cnt DESC
+            """)
+            by_type = cur.fetchall()
+            cur.execute("""
+                SELECT source_type, service_name, status, COUNT(*) AS cnt,
                        ROUND(AVG(duration_ms)) AS avg_ms,
                        MAX(telemetry_timestamp) AS latest
                 FROM telemetry_embeddings
-                GROUP BY service_name, status
+                GROUP BY source_type, service_name, status
                 ORDER BY service_name, cnt DESC
             """)
             rows = cur.fetchall()
@@ -86,11 +94,12 @@ def stats():
         conn.close()
     return {
         "total_records": total,
+        "by_type": {r[0]: r[1] for r in by_type},
         "breakdown": [
             {
-                "service":   r[0], "status": r[1],
-                "count":     r[2], "avg_duration_ms": r[3],
-                "latest":    str(r[4]),
+                "source_type": r[0], "service": r[1], "status": r[2],
+                "count":       r[3], "avg_duration_ms": r[4],
+                "latest":      str(r[5]),
             }
             for r in rows
         ],
@@ -109,7 +118,7 @@ def query(req: QueryRequest):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT service_name, operation_name, status, duration_ms,
+                SELECT source_type, service_name, operation_name, status, duration_ms,
                        raw_text, telemetry_timestamp,
                        1 - (embedding <=> %s::vector) AS similarity
                 FROM   telemetry_embeddings
@@ -127,8 +136,9 @@ def query(req: QueryRequest):
             question=req.question,
             answer=(
                 "No telemetry data is available yet. "
-                "Make sure the microservices are running and generating traces, "
-                "then wait ~30 seconds for the pipeline to index them."
+                "Make sure the microservices are running and generating "
+                "traces, logs, and metrics, then wait ~30 seconds for the "
+                "pipeline to index them."
             ),
             sources=[],
             model=CLAUDE_MODEL,
@@ -137,26 +147,28 @@ def query(req: QueryRequest):
     # 3. Build context string
     sources = []
     context_lines = []
-    for svc, op, status, dur_ms, raw_text, ts, sim in rows:
+    for src_type, svc, op, status, dur_ms, raw_text, ts, sim in rows:
         sources.append(SourceItem(
-            service=svc, operation=op, status=status,
+            source_type=src_type, service=svc, operation=op, status=status,
             duration_ms=dur_ms, timestamp=str(ts),
             similarity=round(float(sim), 3),
         ))
-        context_lines.append(f"[{ts}] {raw_text}")
+        context_lines.append(f"[{ts}] ({src_type}) {raw_text}")
 
     context = "\n".join(context_lines)
 
     # 4. Ask Claude
     system_prompt = (
         "You are an expert Site Reliability Engineer (SRE) analysing distributed "
-        "trace telemetry from a Spring Boot microservices application.\n\n"
+        "telemetry (traces, logs, and metrics) from a Spring Boot microservices "
+        "application.\n\n"
         "The application is an online store with five services: "
         "catalog-service (products), order-service (order lifecycle), "
         "inventory-service (stock), payment-service (payments), "
         "shipment-service (delivery). They communicate asynchronously via RabbitMQ.\n\n"
         "Telemetry is collected with OpenTelemetry and stored as vector embeddings. "
-        "The context below is the most semantically similar telemetry to the user's question.\n\n"
+        "The context below is the most semantically similar telemetry to the user's "
+        "question; each line may be a trace span, a log record, or a metric data point.\n\n"
         "Instructions:\n"
         "- Answer directly and specifically using the telemetry data provided.\n"
         "- Call out error patterns, slow operations, or anomalies you notice.\n"
@@ -220,6 +232,7 @@ DEMO_HTML = """<!DOCTYPE html>
   .sources { margin-top: 8px; }
   .source-item { font-size: 11px; color: #64748b; border-left: 2px solid #1e3a5f; padding: 4px 8px; margin-bottom: 4px; line-height: 1.4; }
   .source-item .svc { color: #60a5fa; font-weight: 500; }
+  .source-item .type { display: inline-block; font-size: 9px; font-weight: 600; letter-spacing: 0.5px; color: #0f1117; background: #475569; border-radius: 3px; padding: 1px 4px; margin-right: 4px; vertical-align: middle; }
   .source-item .ok { color: #34d399; }
   .source-item .err { color: #f87171; }
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #1e3a5f; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; }
@@ -322,8 +335,10 @@ async function sendQuery() {
       const d = document.createElement('div');
       d.className = 'source-item';
       const statusClass = (s.status || '').includes('ERROR') ? 'err' : 'ok';
-      d.innerHTML = `<span class="svc">${s.service || '?'}</span> · ${s.operation || '?'}<br>
-        <span class="${statusClass}">${s.status || 'OK'}</span> · ${s.duration_ms ?? '?'}ms · sim ${s.similarity}`;
+      const dur = (s.duration_ms ?? null) !== null ? ` · ${s.duration_ms}ms` : '';
+      const type = (s.source_type || 'trace').toUpperCase();
+      d.innerHTML = `<span class="type">${type}</span> <span class="svc">${s.service || '?'}</span> · ${s.operation || '—'}<br>
+        <span class="${statusClass}">${s.status || 'OK'}</span>${dur} · sim ${s.similarity}`;
       sa.appendChild(d);
     });
 
