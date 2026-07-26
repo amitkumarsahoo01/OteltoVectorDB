@@ -4,3 +4,10 @@ anthropic==0.40.0
 sentence-transformers==3.3.1
 psycopg2-binary==2.9.10
 pgvector==0.3.5
+
+opentelemetry-api==1.36.0
+opentelemetry-sdk==1.36.0
+opentelemetry-exporter-otlp-proto-grpc==1.36.0
+opentelemetry-instrumentation-fastapi==0.57b0
+opentelemetry-instrumentation-logging==0.57b0
+opentelemetry-instrumentation-psycopg2==0.57b0

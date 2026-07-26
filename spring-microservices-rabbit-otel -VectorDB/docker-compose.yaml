@@ -163,6 +163,8 @@ services:
       GF_SERVER_HTTP_PORT: "3000"
     ports:
       - "3000:3000"
+    volumes:
+      - ./service-configs/grafana/provisioning:/etc/grafana/provisioning
     depends_on: [prometheus, tempo, loki]
     networks: [observability]
 
@@ -245,6 +247,7 @@ services:
       <<: [*db-env, *rabbit-env, *otel-env]
       DB_URL: jdbc:postgresql://postgres:5432/paymentdb
       OTEL_SERVICE_NAME: payment-service
+      PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0.4}
     ports:
       - "8103:8103"
     depends_on:
@@ -305,16 +308,21 @@ services:
       dockerfile: Dockerfile
     container_name: rag-service
     environment:
+      <<: *otel-env
       DB_URL: postgresql://postgres:postgres@postgres:5432/telemetrydb
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       CLAUDE_MODEL: claude-haiku-4-5-20251001
       TOP_K: "12"
+      OTEL_SERVICE_NAME: rag-service
+      OTEL_LOGS_EXPORTER: otlp
     ports:
       - "8200:8200"
     depends_on:
       postgres:
         condition: service_healthy
       telemetry-pipeline:
+        condition: service_started
+      otel-collector:
         condition: service_started
     networks: [ai]
 

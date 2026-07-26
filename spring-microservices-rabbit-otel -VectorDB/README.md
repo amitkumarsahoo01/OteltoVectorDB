@@ -1,22 +1,43 @@
-# 🛒 Distributed Online Store (Spring Boot + RabbitMQ + OpenTelemetry)
+# 🛒 Distributed Online Store — Spring Boot + RabbitMQ + OpenTelemetry + Vector DB RAG
 
-This is a demo project that showcases a **microservices-based online store** built using **Spring Boot**, **RabbitMQ**, and **OpenTelemetry** for distributed tracing with **Jaeger**.
+This project started as a demo **microservices-based online store** built with **Spring Boot**, **RabbitMQ**, and **OpenTelemetry**, and has grown into a full local sandbox for **observability-driven AI**: every trace produced by the store is embedded into **pgvector** and made queryable in plain English through a **Claude-powered RAG service**.
 
 ---
 
 ## 📦 Architecture Overview
 
-This project is composed of 5 independent microservices:
+The stack is organized into three logical clusters, all wired together by Docker Compose:
 
-| Service            | Description                                      |
-|--------------------|--------------------------------------------------|
-| `catalog-service`  | Manages product catalog (name, price)            |
-| `order-service`    | Accepts orders and tracks status                 |
-| `inventory-service`| Reserves product stock on order                  |
-| `payment-service`  | Simulates payment processing                     |
-| `shipment-service` | Simulates shipment creation                      |
+```
+┌─ App cluster ───────────────────────────────────────────────────────────┐
+│  catalog · order · inventory · payment · shipment  (Spring Boot/OTel)   │
+│  postgres (pgvector)  ·  rabbitmq                                       │
+└───────────────────────────────────────────────────────────────────────────┘
+┌─ Observability cluster ────────────────────────────────────────────────┐
+│  otel-collector · jaeger · tempo · prometheus · loki · grafana         │
+└───────────────────────────────────────────────────────────────────────────┘
+┌─ AI pipeline ───────────────────────────────────────────────────────────┐
+│  telemetry-pipeline (OTel → pgvector)  ·  rag-service (Claude RAG)      │
+└───────────────────────────────────────────────────────────────────────────┘
+```
 
-All services communicate asynchronously using **RabbitMQ** with topic exchanges and routing keys. Traces are collected and visualized in **Jaeger**, via **OpenTelemetry OTLP over gRPC**.
+| Component              | Description                                                        |
+|------------------------|----------------------------------------------------------------------|
+| `catalog-service`      | Manages product catalog (name, price)                               |
+| `order-service`        | Accepts orders and tracks status                                    |
+| `inventory-service`    | Reserves product stock on order                                     |
+| `payment-service`      | Simulates payment processing (configurable failure rate)            |
+| `shipment-service`     | Simulates shipment creation                                         |
+| `postgres` (pgvector)  | Per-service databases + a `telemetrydb` with a vector-indexed embeddings table |
+| `rabbitmq`             | Async messaging backbone between the 5 services                     |
+| `otel-collector`       | Receives OTLP traces/metrics and fans them out to the observability backends |
+| `jaeger` / `tempo`     | Trace storage + UI                                                   |
+| `prometheus` / `loki`  | Metrics and log storage                                              |
+| `grafana`              | Dashboards over Prometheus/Tempo/Loki                                |
+| `telemetry-pipeline`   | Polls Jaeger, embeds spans with `all-MiniLM-L6-v2`, writes to pgvector |
+| `rag-service`          | FastAPI app: retrieves relevant spans from pgvector and answers questions via the Claude API |
+
+All 5 store services communicate asynchronously using **RabbitMQ** with topic exchanges and routing keys. Traces are collected via **OpenTelemetry OTLP over gRPC** and fanned out to Jaeger/Tempo/Prometheus/Loki/Grafana — and, from there, into the vector DB / RAG pipeline described below.
 
 ---
 
@@ -65,7 +86,7 @@ sequenceDiagram
 
 ```
 
-All messages are defined using clean, structured DTOs, and published via Spring’s `RabbitTemplate`. Tracing headers are propagated automatically through RabbitMQ using OpenTelemetry and Micrometer.
+All messages are defined using clean, structured DTOs, and published via Spring's `RabbitTemplate`. Tracing headers are propagated automatically through RabbitMQ using OpenTelemetry and Micrometer.
 
 ---
 
@@ -82,21 +103,22 @@ All messages are defined using clean, structured DTOs, and published via Spring�
 
 ---
 
-## 🕵️ Distributed Tracing
+## 🕵️ Observability → Vector DB → RAG
 
-This project uses:
+Beyond distributed tracing, this project turns telemetry into a queryable knowledge base:
 
-- [OpenTelemetry Java Agent](https://github.com/open-telemetry/opentelemetry-java-instrumentation)
-- [Jaeger](https://www.jaegertracing.io/) as the trace backend
-- OTLP over gRPC (`4317`) for trace export
-- Micrometer Tracing via Spring Boot 3
+1. Each service is instrumented with the **OpenTelemetry Java Agent** and exports traces/metrics via **OTLP over gRPC** to the `otel-collector`.
+2. The collector fans traces out to **Jaeger** and **Tempo**, metrics to **Prometheus**, and logs to **Loki** — all visualized in **Grafana**.
+3. `telemetry-pipeline` (Python) polls Jaeger, converts spans into text, embeds them with `all-MiniLM-L6-v2`, and stores them in a `pgvector`-backed `telemetry_embeddings` table (HNSW cosine index) inside Postgres.
+4. `rag-service` (Python/FastAPI) embeds an incoming question, retrieves the most relevant spans from pgvector, and asks the **Claude API** to answer using that context — exposed through a small demo UI.
 
-Trace data includes:
-- All HTTP requests
-- All RabbitMQ messages (send and receive)
-- Correlated spans across services
+This means you can ask things like *"are there any errors?"* or *"which service has the slowest operations?"* and get an answer grounded in the actual traces your services produced.
 
-Access the Jaeger UI at: [http://localhost:16686](http://localhost:16686)
+Access points:
+- Jaeger UI: [http://localhost:16686](http://localhost:16686)
+- Grafana: [http://localhost:3000](http://localhost:3000) (`admin` / `verysecret`)
+- RAG demo UI: [http://localhost:8200](http://localhost:8200)
+- Telemetry pipeline stats: [http://localhost:9000/stats](http://localhost:9000/stats)
 
 ---
 
@@ -104,9 +126,9 @@ Access the Jaeger UI at: [http://localhost:16686](http://localhost:16686)
 
 ### 🐳 Requirements
 
-- Java 17+
-- Docker + Docker Compose
-- Maven
+- Docker + Docker Compose (everything, including the Spring Boot services, builds and runs inside containers)
+- An [Anthropic API key](https://console.anthropic.com/) for the RAG service
+- ~6GB RAM available to Docker Desktop (the embedding model runs in two Python containers)
 
 ### 📁 Clone the Repo
 
@@ -114,41 +136,42 @@ Access the Jaeger UI at: [http://localhost:16686](http://localhost:16686)
 git clone https://github.com/datmt/spring-microservices-rabbit-otel
 ```
 
-### 🧰 Start Infrastructure
+### 🔑 Set your Claude API key
 
 ```bash
-docker compose -f infra-docker-compose.yaml up -d
+export ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-This starts:
-- 🐇 RabbitMQ (internal)
-- 📈 Jaeger UI (on `http://localhost:16686`)
+On Windows (PowerShell):
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
+```
 
----
-
-### 🛠 Run Services with Tracing
-
-Each service can be run like this:
+### 🧰 Build and start everything
 
 ```bash
-java \
-  -javaagent:opentelemetry-javaagent.jar \
-  -Dotel.service.name=order-service \
-  -Dotel.exporter.otlp.endpoint=http://localhost:4317 \
-  -Dotel.exporter.otlp.protocol=grpc \
-  -Dotel.logs.exporter=none \
-  -jar order-service/target/order-service.jar
+docker compose up --build
 ```
 
-Change the service name and JAR path per service.
+First build takes ~10-15 minutes (Maven build + Python model download). Subsequent starts take ~2-3 minutes.
+
+> See [SETUP.md](SETUP.md) for a detailed step-by-step walkthrough, the full service/URL table, the architecture diagram, and troubleshooting tips.
 
 ---
 
 ## 🧪 Try the Flow
 
-1. Start all services with the agent
-2. Use Postman or a browser to call the catalog and order endpoints
-3. Watch traces appear in Jaeger
+1. `docker compose up --build` and wait for all services to report healthy.
+2. Hit the catalog and order APIs directly, or run the included load generator to produce a realistic, mixed traffic pattern (successful orders and categorized failures):
+   ```bash
+   ./scripts/load-test.sh
+   ```
+3. Watch traces appear in Jaeger/Grafana, and wait ~30s for `telemetry-pipeline` to index them (check `http://localhost:9000/stats`).
+4. Open the RAG demo at [http://localhost:8200](http://localhost:8200) and ask questions about what happened, e.g.:
+   - "Are there any errors?"
+   - "Which service has the slowest operations?"
+   - "Show me the order placement flow and timings"
+   - "Give me a health summary of all services"
 
 ---
 
@@ -156,24 +179,32 @@ Change the service name and JAR path per service.
 
 ```
 .
-├── catalog-service/
-├── order-service/
-├── inventory-service/
-├── payment-service/
-├── shipment-service/
-├── common/                  # Shared DTOs and constants
-├── docker-compose.yml       # Jaeger setup
-└── otel-javaagent.jar       # OpenTelemetry agent
+├── catalog-service/          # Spring Boot service
+├── order-service/            # Spring Boot service
+├── inventory-service/        # Spring Boot service
+├── payment-service/          # Spring Boot service
+├── shipment-service/         # Spring Boot service
+├── common/                   # Shared DTOs and constants
+├── postgres/init.sh          # Creates per-service DBs + pgvector + embeddings table
+├── service-configs/          # Env-var-driven application.yaml per service, Grafana provisioning
+├── telemetry-pipeline/       # Python: Jaeger → embeddings → pgvector
+├── rag-service/              # Python FastAPI: Claude RAG + demo UI
+├── scripts/load-test.sh      # Traffic generator for demo/telemetry data
+├── docker-compose.yaml       # Full stack (app + observability + AI pipeline)
+├── otel-collector-config.yaml
+├── tempo-config.yaml
+├── prometheus.yml
+└── opentelemetry-javaagent.jar
 ```
 
 ---
 
 ## 📋 Notes
 
-- No database persistence for simplicity — uses in-memory data stores.
+- Persistence has moved from in-memory stores to **Postgres** (one database per service, plus `telemetrydb` for embeddings).
 - No authentication or customer service to keep services focused and isolated.
-- Each service is decoupled and communicates through events only.
-- DTOs and messaging topics are shared via the `common` module.
+- Each store service is decoupled and communicates through events only; DTOs and messaging topics are shared via the `common` module.
+- `PAYMENT_FAILURE_RATE` (env var, default `0.4`) controls how often payment-service simulates a decline, useful for generating error traces to query.
 
 ---
 
@@ -181,17 +212,20 @@ Change the service name and JAR path per service.
 
 - [OpenTelemetry for Java](https://opentelemetry.io/docs/instrumentation/java/)
 - [Jaeger Tracing](https://www.jaegertracing.io/)
+- [Grafana Tempo](https://grafana.com/oss/tempo/)
 - [Micrometer Tracing](https://micrometer.io/docs/tracing)
 - [Spring AMQP](https://spring.io/projects/spring-amqp)
+- [pgvector](https://github.com/pgvector/pgvector)
+- [Claude API](https://docs.claude.com/)
 
 ---
 
 ## 📣 Contributions Welcome
 
-If you'd like to extend this with more realistic features (Postgres, Eureka, API Gateway, Prometheus), feel free to fork and contribute!
+Feel free to fork and extend this — more realistic failure scenarios, additional dashboards, or richer RAG retrieval strategies are all fair game.
 
 ---
 
 ## 📝 License
 
-MIT 
+MIT

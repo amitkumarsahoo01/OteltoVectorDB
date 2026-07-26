@@ -39,3 +39,12 @@ build/
 
 *.db
 .idea
+
+### Python ###
+__pycache__/
+*.pyc
+
+### Logs ###
+load-test-logs/
+*.log
+hs_err_pid*.log

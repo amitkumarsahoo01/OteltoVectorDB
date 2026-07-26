@@ -19,6 +19,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "telemetrydb" <<-EO
         id          SERIAL PRIMARY KEY,
         source_type VARCHAR(20)  NOT NULL,           -- 'trace', 'log', or 'metric'
         source_id   VARCHAR(512) NOT NULL UNIQUE,    -- trace_id+span_id or log hash
+        trace_id        VARCHAR(64),                 -- OTel trace id, when known
         service_name    VARCHAR(255),
         operation_name  VARCHAR(512),
         status          VARCHAR(50),
@@ -41,6 +42,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "telemetrydb" <<-EO
     CREATE INDEX IF NOT EXISTS idx_telemetry_service    ON telemetry_embeddings (service_name);
     CREATE INDEX IF NOT EXISTS idx_telemetry_status     ON telemetry_embeddings (status);
     CREATE INDEX IF NOT EXISTS idx_telemetry_ts         ON telemetry_embeddings (telemetry_timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_telemetry_trace_id   ON telemetry_embeddings (trace_id);
 EOSQL
 
 echo ">>> Postgres init complete: catalogdb, orderdb, inventorydb, paymentdb, shipmentdb, telemetrydb created."

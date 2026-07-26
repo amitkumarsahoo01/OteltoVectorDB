@@ -65,8 +65,15 @@ public class InventoryService {
 
         for (OrderPlacedEvent.Item item : event.items()) {
             InventoryItem inventory = inventoryMap.get(item.productUlid());
-            if (inventory == null || !inventory.isInStock(item.quantity())) {
+            if (inventory == null) {
                 failedItems.add(item);
+                log.warn("Inventory check failed for order {}: product {} not found in inventory (reason=PRODUCT_NOT_FOUND)",
+                        event.orderUlid(), item.productUlid());
+            } else if (!inventory.isInStock(item.quantity())) {
+                failedItems.add(item);
+                int available = inventory.getAvailableQuantity() - inventory.getReservedQuantity();
+                log.warn("Inventory check failed for order {}: product {} insufficient stock, requested={} available={} (reason=INSUFFICIENT_STOCK)",
+                        event.orderUlid(), item.productUlid(), item.quantity(), available);
             } else {
                 inventory.reserve(item.quantity());
                 reservedItems.add(item);

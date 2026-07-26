@@ -10,19 +10,36 @@ import com.datmt.learning.java.payment.repository.PaymentRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class PaymentService {
     private final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
+    // Distinct, categorizable decline reasons — real payment gateways fail for
+    // more than one reason, and telemetry/RAG queries need that variety to
+    // group failures meaningfully instead of seeing one generic message.
+    private static final String[] FAILURE_REASONS = {
+            "Card declined",
+            "Insufficient funds",
+            "Card expired",
+            "Payment gateway timeout",
+            "Fraud check failed",
+            "Invalid CVV",
+    };
+
     private final PaymentRepository repo;
     private final RabbitTemplate rabbitTemplate;
+
+    @Value("${payment.failure-rate:0.4}")
+    private double failureRate;
 
     public PaymentService(PaymentRepository repo, RabbitTemplate rabbitTemplate) {
         this.repo = repo;
@@ -47,7 +64,7 @@ public class PaymentService {
         payment.setAmount(totalAmount);
         payment.setStatus(PaymentStatus.PENDING);
 
-        boolean success = Math.random() > 0.4; // simulate 60% success
+        boolean success = ThreadLocalRandom.current().nextDouble() >= failureRate;
 
         if (success) {
             payment.setStatus(PaymentStatus.SUCCESS);
@@ -66,7 +83,7 @@ public class PaymentService {
 
         } else {
             payment.setStatus(PaymentStatus.FAILED);
-            payment.setFailureReason("Card declined");
+            payment.setFailureReason(FAILURE_REASONS[ThreadLocalRandom.current().nextInt(FAILURE_REASONS.length)]);
             repo.save(payment);
 
             PaymentFailedEvent failed = new PaymentFailedEvent(

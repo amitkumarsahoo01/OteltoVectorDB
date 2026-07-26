@@ -23,7 +23,7 @@ import httpx
 import psycopg2
 from fastapi import FastAPI, Request, Response
 from pgvector.psycopg2 import register_vector
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 from sentence_transformers import SentenceTransformer
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -51,24 +51,62 @@ def get_conn():
     register_vector(conn)
     return conn
 
-def _store_embedding(conn, *, source_type: str, source_id: str, service_name: str,
-                     operation_name, status, duration_ms, attributes: dict,
-                     raw_text: str, ts) -> bool:
-    """Embed raw_text and upsert one row. Returns True if newly inserted."""
-    embedding = EMBED_MODEL.encode(raw_text).tolist()
+def _batch_store(conn, records: list[dict]) -> int:
+    """Embed and upsert a whole push's worth of records in one shot.
+
+    A single record at a time (the old behaviour) meant one CPU-bound
+    SentenceTransformer.encode() call per span/log/metric — under any real
+    load burst that fell behind the OTel Collector's request rate, causing
+    HTTP timeouts and the Collector dropping data outright. Batching the
+    encode() call, and skipping already-stored source_ids *before* paying
+    the embedding cost (important because the Jaeger poller re-fetches
+    overlapping spans every cycle), fixes both.
+
+    Each record needs: source_type, source_id, trace_id, service_name,
+    operation_name, status, duration_ms, attributes, raw_text, ts.
+    Returns the number of newly inserted rows.
+    """
+    if not records:
+        return 0
+
+    # De-dup within this batch itself (keep first occurrence of a source_id).
+    by_id: dict[str, dict] = {}
+    for r in records:
+        by_id.setdefault(r["source_id"], r)
+    records = list(by_id.values())
+
     with conn.cursor() as cur:
         cur.execute(
+            "SELECT source_id FROM telemetry_embeddings WHERE source_id = ANY(%s)",
+            (list(by_id.keys()),),
+        )
+        existing = {row[0] for row in cur.fetchall()}
+
+    new_records = [r for r in records if r["source_id"] not in existing]
+    if not new_records:
+        return 0
+
+    embeddings = EMBED_MODEL.encode([r["raw_text"] for r in new_records]).tolist()
+
+    values = [
+        (r["source_type"], r["source_id"], r["trace_id"], r["service_name"],
+         r["operation_name"], r["status"], r["duration_ms"], Json(r["attributes"]),
+         r["raw_text"], emb, r["ts"])
+        for r, emb in zip(new_records, embeddings)
+    ]
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
             """
             INSERT INTO telemetry_embeddings
-                (source_type, source_id, service_name, operation_name, status,
+                (source_type, source_id, trace_id, service_name, operation_name, status,
                  duration_ms, attributes, raw_text, embedding, telemetry_timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES %s
             ON CONFLICT (source_id) DO NOTHING
             """,
-            (source_type, source_id, service_name, operation_name, status,
-             duration_ms, Json(attributes), raw_text, embedding, ts),
+            values,
         )
-        inserted = cur.rowcount == 1
+        inserted = cur.rowcount
     conn.commit()
     return inserted
 
@@ -98,8 +136,8 @@ def _resource_service_name(resource) -> str:
             return attr.value.string_value
     return "unknown"
 
-def store_span(conn, trace_id: str, span: dict, service_name: str) -> bool:
-    """Embed one span and upsert into telemetry_embeddings. Returns True if new."""
+def build_span_record(trace_id: str, span: dict, service_name: str) -> dict:
+    """Build a telemetry_embeddings row (minus embedding) for one span."""
     span_id   = span.get("spanID", "")
     source_id = f"trace-{trace_id}-{span_id}"
 
@@ -138,18 +176,18 @@ def store_span(conn, trace_id: str, span: dict, service_name: str) -> bool:
         parts.append(f"Queue: {mq_dest}")
 
     raw_text = " | ".join(parts)
-    return _store_embedding(
-        conn,
-        source_type="trace",
-        source_id=source_id,
-        service_name=service_name,
-        operation_name=op,
-        status=status,
-        duration_ms=duration_us // 1000,
-        attributes=tags,
-        raw_text=raw_text,
-        ts=ts,
-    )
+    return {
+        "source_type": "trace",
+        "source_id": source_id,
+        "trace_id": trace_id,
+        "service_name": service_name,
+        "operation_name": op,
+        "status": status,
+        "duration_ms": duration_us // 1000,
+        "attributes": tags,
+        "raw_text": raw_text,
+        "ts": ts,
+    }
 
 # ── OTLP HTTP receiver (called by OTel Collector) ─────────────────────────────
 def decode_otlp_traces(body: bytes) -> list[dict]:
@@ -228,8 +266,8 @@ def decode_otlp_logs(body: bytes) -> list[dict]:
                 })
     return out
 
-def store_log(conn, rec: dict) -> bool:
-    """Embed one log record and upsert into telemetry_embeddings."""
+def build_log_record(rec: dict) -> dict:
+    """Build a telemetry_embeddings row (minus embedding) for one log record."""
     service_name = rec["service"]
     severity     = rec["severity"]
     body         = rec["body"]
@@ -257,18 +295,18 @@ def store_log(conn, rec: dict) -> bool:
         attrs.setdefault("span_id", rec["span_id"])
 
     raw_text = " | ".join(parts)
-    return _store_embedding(
-        conn,
-        source_type="log",
-        source_id=source_id,
-        service_name=service_name,
-        operation_name=None,
-        status=severity,
-        duration_ms=None,
-        attributes=attrs,
-        raw_text=raw_text,
-        ts=ts,
-    )
+    return {
+        "source_type": "log",
+        "source_id": source_id,
+        "trace_id": rec["trace_id"] or None,
+        "service_name": service_name,
+        "operation_name": None,
+        "status": severity,
+        "duration_ms": None,
+        "attributes": attrs,
+        "raw_text": raw_text,
+        "ts": ts,
+    }
 
 # ── OTLP metrics ──────────────────────────────────────────────────────────────
 def _metric_point_value(kind: str, dp) -> Any:
@@ -316,8 +354,8 @@ def decode_otlp_metrics(body: bytes) -> list[dict]:
                     })
     return out
 
-def store_metric(conn, rec: dict) -> bool:
-    """Embed one metric data point and upsert into telemetry_embeddings."""
+def build_metric_record(rec: dict) -> dict:
+    """Build a telemetry_embeddings row (minus embedding) for one metric data point."""
     service_name = rec["service"]
     name         = rec["name"]
     value        = rec["value"]
@@ -347,18 +385,18 @@ def store_metric(conn, rec: dict) -> bool:
         parts.append(f"Attributes: {kv}")
 
     raw_text = " | ".join(parts)
-    return _store_embedding(
-        conn,
-        source_type="metric",
-        source_id=source_id,
-        service_name=service_name,
-        operation_name=name,
-        status="OK",
-        duration_ms=None,
-        attributes=attrs,
-        raw_text=raw_text,
-        ts=ts,
-    )
+    return {
+        "source_type": "metric",
+        "source_id": source_id,
+        "trace_id": None,
+        "service_name": service_name,
+        "operation_name": name,
+        "status": "OK",
+        "duration_ms": None,
+        "attributes": attrs,
+        "raw_text": raw_text,
+        "ts": ts,
+    }
 
 # ── Jaeger poll (catch historical / missed spans) ─────────────────────────────
 async def poll_jaeger():
@@ -367,26 +405,27 @@ async def poll_jaeger():
     start_us = int(start.timestamp() * 1e6)
     end_us   = int(end.timestamp() * 1e6)
 
-    conn    = get_conn()
-    total   = 0
+    records = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for svc in SERVICES:
+            try:
+                r = await client.get(
+                    f"{JAEGER_URL}/api/traces",
+                    params={"service": svc, "start": start_us, "end": end_us, "limit": 500},
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json().get("data", [])
+                for trace in data:
+                    tid = trace.get("traceID", "")
+                    for span in trace.get("spans", []):
+                        records.append(build_span_record(tid, span, svc))
+            except Exception as exc:
+                log.warning(f"Jaeger poll error for {svc}: {exc}")
+
+    conn = get_conn()
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            for svc in SERVICES:
-                try:
-                    r = await client.get(
-                        f"{JAEGER_URL}/api/traces",
-                        params={"service": svc, "start": start_us, "end": end_us, "limit": 500},
-                    )
-                    if r.status_code != 200:
-                        continue
-                    data = r.json().get("data", [])
-                    for trace in data:
-                        tid = trace.get("traceID", "")
-                        for span in trace.get("spans", []):
-                            if store_span(conn, tid, span, svc):
-                                total += 1
-                except Exception as exc:
-                    log.warning(f"Jaeger poll error for {svc}: {exc}")
+        total = _batch_store(conn, records)
     finally:
         conn.close()
 
@@ -429,12 +468,11 @@ async def receive_traces(request: Request):
     body = await _read_body(request)
     try:
         spans_data = decode_otlp_traces(body)
-        conn  = get_conn()
-        count = 0
+        records = [build_span_record(item["span"]["traceID"], item["span"], item["service"])
+                   for item in spans_data]
+        conn = get_conn()
         try:
-            for item in spans_data:
-                if store_span(conn, item["span"]["traceID"], item["span"], item["service"]):
-                    count += 1
+            count = _batch_store(conn, records)
         finally:
             conn.close()
         if count:
@@ -449,13 +487,11 @@ async def receive_logs(request: Request):
     """OTLP HTTP logs endpoint — called by OTel Collector."""
     body = await _read_body(request)
     try:
-        records = decode_otlp_logs(body)
-        conn  = get_conn()
-        count = 0
+        log_recs = decode_otlp_logs(body)
+        records = [build_log_record(rec) for rec in log_recs]
+        conn = get_conn()
         try:
-            for rec in records:
-                if store_log(conn, rec):
-                    count += 1
+            count = _batch_store(conn, records)
         finally:
             conn.close()
         if count:
@@ -469,13 +505,11 @@ async def receive_metrics(request: Request):
     """OTLP HTTP metrics endpoint — called by OTel Collector."""
     body = await _read_body(request)
     try:
-        records = decode_otlp_metrics(body)
-        conn  = get_conn()
-        count = 0
+        metric_recs = decode_otlp_metrics(body)
+        records = [build_metric_record(rec) for rec in metric_recs]
+        conn = get_conn()
         try:
-            for rec in records:
-                if store_metric(conn, rec):
-                    count += 1
+            count = _batch_store(conn, records)
         finally:
             conn.close()
         if count:
